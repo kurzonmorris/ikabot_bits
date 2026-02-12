@@ -7,14 +7,38 @@ import logging.handlers
 
 from ikabot.config import LOGS_DIRECTORY_FILE, DEFAULT_LOG_LEVEL
 
+
+class SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler that survives rotation failures.
+
+    On Windows, another ikabot process may hold the log file open,
+    causing ``PermissionError`` during ``doRollover``.  When that
+    happens we skip the rotation and reopen the stream so logging
+    can continue without crashing the process.
+    """
+
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except (PermissionError, OSError):
+            # Rotation failed (likely another process holds the file).
+            # Close the current stream and reopen so we can keep writing.
+            if self.stream:
+                try:
+                    self.stream.close()
+                except Exception:
+                    pass
+            self.stream = self._open()
+
+
 # TODO wrap logging functions to remove cookies from logs, or add a filter
 class IkabotLogger(logging.Logger):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-logging.setLoggerClass(IkabotLogger)    
+logging.setLoggerClass(IkabotLogger)
 
 # Create custom file logger
-rotatingFileHandler = logging.handlers.RotatingFileHandler(
+rotatingFileHandler = SafeRotatingFileHandler(
                 filename=LOGS_DIRECTORY_FILE,
                 maxBytes=10 * 1024 * 1024, #max logfile size is 10 MB
                 backupCount=10, # max number of log files is 10
