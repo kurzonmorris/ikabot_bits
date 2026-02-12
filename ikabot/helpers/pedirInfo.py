@@ -267,12 +267,15 @@ def getIdsOfCities(session, all=False):
     global ids_cache
     if ids_cache is None or cities_cache is None or session.padre is False:
         html = session.get()
-        cities_cache = (
-            re.search(
-                r'relatedCityData:\sJSON\.parse\(\'(.+?),\\"additionalInfo', html
-            ).group(1)
-            + "}"
+        match = re.search(
+            r'relatedCityData:\sJSON\.parse\(\'(.+?),\\"additionalInfo', html
         )
+        if match is None:
+            raise Exception(
+                "Could not parse city data from server response. "
+                "The session may have expired or the game page format has changed."
+            )
+        cities_cache = match.group(1) + "}"
         cities_cache = cities_cache.replace("\\", "")
         cities_cache = cities_cache.replace("city_", "")
         cities_cache = json.loads(cities_cache, strict=False)
