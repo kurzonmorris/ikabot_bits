@@ -266,38 +266,52 @@ def getIdsOfCities(session, all=False):
     global cities_cache
     global ids_cache
     if ids_cache is None or cities_cache is None or session.padre is False:
-        html = session.get()
-        match = re.search(
-            r'relatedCityData:\sJSON\.parse\(\'(.+?),\\"additionalInfo', html
-        )
-        if match is None:
-            # Fallback: try more flexible patterns in case the game changed formatting
-            match = re.search(
-                r'relatedCityData:\s*JSON\.parse\(\'(.+?),\\?"additionalInfo', html
-            )
-        if match is None:
-            # Try without the additionalInfo anchor
-            match = re.search(
-                r'relatedCityData:\s*JSON\.parse\(\'(.+?\})', html
-            )
-        if match is None:
-            # Retry once - session might have returned a stale/incomplete page
-            import time
-            time.sleep(2)
+        import time
+
+        # The server sometimes returns HTTP error pages (short HTML with no
+        # game data) instead of the real page.  Retry with back-off.
+        max_retries = 5
+        html = None
+        match = None
+
+        for attempt in range(max_retries):
             html = session.get()
+
+            # A real game page is several KB; error pages are typically < 1 KB
+            if len(html) < 1000 and 'relatedCityData' not in html:
+                wait_secs = 5 * (attempt + 1)  # 5, 10, 15, 20, 25
+                time.sleep(wait_secs)
+                continue
+
             match = re.search(
                 r'relatedCityData:\sJSON\.parse\(\'(.+?),\\"additionalInfo', html
             )
+            if match is None:
+                # Fallback: flexible escaping / whitespace
+                match = re.search(
+                    r'relatedCityData:\s*JSON\.parse\(\'(.+?),\\?"additionalInfo', html
+                )
+            if match is None:
+                # Fallback: drop the additionalInfo anchor
+                match = re.search(
+                    r'relatedCityData:\s*JSON\.parse\(\'(.+?\})', html
+                )
+            if match is not None:
+                break
+
+            # No match on a full-size page -- wait and retry once more
+            time.sleep(5)
+
         if match is None:
-            # Collect diagnostic info for the error message
             has_doctype = '!DOCTYPE' in html
             has_logout = 'logout' in html.lower()
             has_related = 'relatedCityData' in html
             has_json_parse = 'JSON.parse' in html
             html_len = len(html)
-            html_preview = html[:200].replace('\n', ' ').strip()
+            html_preview = html[:300].replace('\n', ' ').strip()
             raise Exception(
-                "Could not parse city data from server response.\n"
+                "Could not parse city data from server response "
+                f"after {max_retries} attempts.\n"
                 f"HTML length: {html_len}, has DOCTYPE: {has_doctype}, "
                 f"has logout: {has_logout}, has relatedCityData: {has_related}, "
                 f"has JSON.parse: {has_json_parse}\n"
