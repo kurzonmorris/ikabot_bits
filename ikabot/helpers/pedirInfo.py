@@ -271,11 +271,42 @@ def getIdsOfCities(session, all=False):
             r'relatedCityData:\sJSON\.parse\(\'(.+?),\\"additionalInfo', html
         )
         if match is None:
-            raise Exception(
-                "Could not parse city data from server response. "
-                "The session may have expired or the game page format has changed."
+            # Fallback: try more flexible patterns in case the game changed formatting
+            match = re.search(
+                r'relatedCityData:\s*JSON\.parse\(\'(.+?),\\?"additionalInfo', html
             )
-        cities_cache = match.group(1) + "}"
+        if match is None:
+            # Try without the additionalInfo anchor
+            match = re.search(
+                r'relatedCityData:\s*JSON\.parse\(\'(.+?\})', html
+            )
+        if match is None:
+            # Retry once - session might have returned a stale/incomplete page
+            import time
+            time.sleep(2)
+            html = session.get()
+            match = re.search(
+                r'relatedCityData:\sJSON\.parse\(\'(.+?),\\"additionalInfo', html
+            )
+        if match is None:
+            # Collect diagnostic info for the error message
+            has_doctype = '!DOCTYPE' in html
+            has_logout = 'logout' in html.lower()
+            has_related = 'relatedCityData' in html
+            has_json_parse = 'JSON.parse' in html
+            html_len = len(html)
+            html_preview = html[:200].replace('\n', ' ').strip()
+            raise Exception(
+                "Could not parse city data from server response.\n"
+                f"HTML length: {html_len}, has DOCTYPE: {has_doctype}, "
+                f"has logout: {has_logout}, has relatedCityData: {has_related}, "
+                f"has JSON.parse: {has_json_parse}\n"
+                f"Preview: {html_preview}"
+            )
+        cities_cache = match.group(1)
+        # Ensure the JSON ends with a closing brace
+        if not cities_cache.rstrip().endswith('}'):
+            cities_cache = cities_cache + "}"
         cities_cache = cities_cache.replace("\\", "")
         cities_cache = cities_cache.replace("city_", "")
         cities_cache = json.loads(cities_cache, strict=False)
