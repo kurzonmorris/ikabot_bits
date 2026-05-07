@@ -895,10 +895,259 @@ def run_auto_trader(session, csv_path, interval_minutes, settings):
 
 
 # ============================================================
-#  Active Trading (Chunk 4 - stub)
+#  Active Trading + Smart Ship Batching
 # ============================================================
 
+def _set_resource_filter(session, city, resource_index):
+    """Set marketplace to display offers for a specific resource.
+    Must be called before getOffers() to get correct resource offers.
+    """
+    search_resource = "resource" if resource_index == 0 else str(resource_index)
+    data = {
+        "cityId": city["id"],
+        "position": city["pos"],
+        "view": "branchOffice",
+        "activeTab": "bargain",
+        "type": 444,
+        "searchResource": search_resource,
+        "range": city["rango"],
+        "backgroundView": "city",
+        "currentCityId": city["id"],
+        "templateView": "branchOffice",
+        "currentTab": "bargain",
+        "actionRequest": actionRequest,
+        "ajax": 1,
+    }
+    session.post(params=data)
+
+
+def allocate_ships(orders, total_ships, ship_capacity):
+    """Allocate ships across orders by priority, then proportionally.
+    Returns dict mapping order_id -> allocated_ships.
+    """
+    if total_ships <= 0 or not orders:
+        return {}
+
+    allocation = {}
+    remaining_ships = total_ships
+
+    # Group by priority
+    priority_groups = {}
+    for o in orders:
+        p = o.get("priority", 2)
+        if p not in priority_groups:
+            priority_groups[p] = []
+        priority_groups[p].append(o)
+
+    for priority in sorted(priority_groups.keys()):
+        if remaining_ships <= 0:
+            break
+        group = priority_groups[priority]
+
+        # Calculate how many ships each order ideally wants
+        wants = {}
+        total_want = 0
+        for o in group:
+            qty = min(o["quantity_remaining"], o["per_cycle"] if o["per_cycle"] > 0 else o["quantity_remaining"])
+            ships_needed = max(1, -(-qty // ship_capacity))  # ceil division
+            wants[o["order_id"]] = ships_needed
+            total_want += ships_needed
+
+        if total_want <= remaining_ships:
+            # Enough ships for everyone in this priority
+            for o in group:
+                alloc = wants[o["order_id"]]
+                allocation[o["order_id"]] = alloc
+                remaining_ships -= alloc
+        else:
+            # Proportional split within this priority
+            for o in group:
+                if remaining_ships <= 0:
+                    break
+                proportion = wants[o["order_id"]] / total_want if total_want > 0 else 0
+                alloc = max(1, int(remaining_ships * proportion))
+                alloc = min(alloc, remaining_ships, wants[o["order_id"]])
+                allocation[o["order_id"]] = alloc
+                remaining_ships -= alloc
+
+    return allocation
+
+
 def process_active_orders(session, city, orders):
-    """Process active buy/sell orders. Returns list of notification strings."""
-    # Chunk 4 will implement full active trading with ship batching
-    return []
+    """Process active buy/sell orders with smart ship batching.
+    Returns list of notification strings.
+    """
+    notifications = []
+
+    # Get available ships and capacity
+    ships_available = getAvailableShips(session)
+    if ships_available <= 0:
+        return []
+
+    ship_capacity, _ = getShipCapacity(session)
+    if ship_capacity <= 0:
+        return []
+
+    # Separate buy and sell orders
+    buy_orders = [o for o in orders if o["order_type"] == "buy" and o["quantity_remaining"] > 0]
+    sell_orders = [o for o in orders if o["order_type"] == "sell" and o["quantity_remaining"] > 0]
+
+    # Sort by priority
+    buy_orders.sort(key=lambda o: (o["priority"], o["order_id"]))
+
+    # Allocate ships across buy orders
+    ship_allocation = allocate_ships(buy_orders, ships_available, ship_capacity)
+
+    # Get gold once
+    gold, _ = getGold(session, city)
+
+    # Process buy orders
+    for order in buy_orders:
+        alloc_ships = ship_allocation.get(order["order_id"], 0)
+        if alloc_ships <= 0:
+            continue
+
+        # Check daily budget
+        if order["daily_budget"] > 0 and order["daily_spent"] >= order["daily_budget"]:
+            continue
+
+        res_idx = _resource_index(order["resource"])
+        if res_idx < 0:
+            continue
+
+        # Set marketplace filter and get offers
+        _set_resource_filter(session, city, res_idx)
+        offers = getOffers(session, city)
+        if not offers:
+            continue
+
+        # Apply strategy filter
+        if order["strategy"] == "specific" and order.get("target_player"):
+            offers = filter_offers_by_player(offers, order["target_player"])
+        elif order["strategy"] == "closest":
+            offers = sort_offers_by_distance(offers)
+
+        # Filter by max price
+        offers = filter_offers_by_max_price(offers, order["price"])
+
+        if not offers:
+            continue
+
+        # Calculate how much we can buy this cycle
+        capacity = alloc_ships * ship_capacity
+        desired = min(order["quantity_remaining"], capacity)
+        if order["per_cycle"] > 0:
+            desired = min(desired, order["per_cycle"])
+
+        # Check gold
+        if order["price"] > 0:
+            affordable = gold // order["price"]
+            desired = min(desired, affordable)
+
+        # Check daily budget remaining
+        if order["daily_budget"] > 0:
+            budget_remaining = order["daily_budget"] - order["daily_spent"]
+            if order["price"] > 0:
+                budget_affordable = budget_remaining // order["price"]
+                desired = min(desired, budget_affordable)
+
+        # Check warehouse space
+        city = _refresh_city(session, city)
+        free_space = city["freeSpaceForResources"][res_idx] if res_idx < len(city.get("freeSpaceForResources", [])) else 0
+        desired = min(desired, free_space)
+
+        if desired <= 0:
+            continue
+
+        # Buy from offers (process best offer first)
+        amount_bought = 0
+        for offer in offers:
+            if desired <= 0:
+                break
+            if offer["amountAvailable"] <= 0:
+                continue
+
+            # Verify offer price is still acceptable
+            if offer["precio"] > order["price"]:
+                continue
+
+            buy_amount = min(desired, offer["amountAvailable"])
+
+            try:
+                buy(session, city, offer, buy_amount, alloc_ships, ship_capacity)
+                amount_bought += buy_amount
+                desired -= buy_amount
+                cost = buy_amount * offer["precio"]
+                gold -= cost
+                order["daily_spent"] += cost
+                break  # One purchase per cycle per order to avoid overwhelming ships
+            except Exception:
+                order["notes"] = str(order.get("notes", "")) + ";buy_error:{}".format(getDateTime())
+                break
+
+        if amount_bought > 0:
+            order["quantity_remaining"] -= amount_bought
+            order["quantity_fulfilled"] += amount_bought
+            order["last_activity"] = getDateTime()
+            notifications.append("Bought {} {} @ {} from {}".format(
+                addThousandSeparator(amount_bought), order["resource"],
+                offer["precio"], offer.get("jugadorAComprar", "?")))
+
+            if order["quantity_remaining"] <= 0:
+                order["status"] = "complete"
+                notifications.append("ORDER #{} COMPLETE: BUY {}".format(
+                    order["order_id"], order["resource"]))
+
+    # Process sell orders (browse buy offers from other players)
+    for order in sell_orders:
+        res_idx = _resource_index(order["resource"])
+        if res_idx < 0:
+            continue
+
+        # Check city has resources to sell
+        city = _refresh_city(session, city)
+        city_avail = city["availableResources"][res_idx] if res_idx < len(city.get("availableResources", [])) else 0
+        if city_avail <= 0:
+            continue
+
+        # For active selling, we browse buy offers (type 333) and sell to the highest bidder
+        # This uses the same marketplace scan mechanism
+        search_resource = "resource" if res_idx == 0 else str(res_idx)
+        data = {
+            "cityId": city["id"],
+            "position": city["pos"],
+            "view": "branchOffice",
+            "activeTab": "bargain",
+            "type": 333,
+            "searchResource": search_resource,
+            "range": city["rango"],
+            "backgroundView": "city",
+            "currentCityId": city["id"],
+            "templateView": "branchOffice",
+            "currentTab": "bargain",
+            "actionRequest": actionRequest,
+            "ajax": "1",
+        }
+        resp = session.post(params=data)
+        try:
+            html = json.loads(resp, strict=False)[1][1][1]
+        except (json.JSONDecodeError, IndexError, KeyError):
+            continue
+
+        # Parse buy offers (people wanting to buy = we can sell to them)
+        # Buy offers show: player wanting to buy, amount they want, price they'll pay
+        buy_offer_prices = re.findall(r'white-space:nowrap;">(\d+)\s', html)
+        if not buy_offer_prices:
+            continue
+
+        # Check if best buy offer meets our minimum price
+        best_price = max(int(p) for p in buy_offer_prices)
+        if best_price < order["price"]:
+            continue
+
+        # Active selling to buy offers would require different API calls
+        # than what's currently available. For now, log that opportunity exists.
+        order["notes"] = str(order.get("notes", "")) + ";sell_opportunity:{}@{}".format(
+            order["resource"], best_price)
+
+    return notifications
