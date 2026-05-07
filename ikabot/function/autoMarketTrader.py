@@ -600,11 +600,225 @@ def _launch_background(session, event, csv_path, city, orders, interval,
 
 
 # ============================================================
-#  Background Loop (Chunk 3 - stub)
+#  Background Loop + Own Offer Processing
 # ============================================================
 
+def _resource_index(resource_name):
+    """Convert resource name to index (0-4)."""
+    try:
+        return VALID_RESOURCES.index(resource_name)
+    except ValueError:
+        return -1
+
+
+def _build_own_offer_payload(city, resource_configs, existing_amounts, existing_prices, existing_types):
+    """Build updateOffers payload. Preserves non-managed resources.
+    resource_configs: dict mapping resource_index -> {type, amount, price}
+    """
+    payload = {
+        "cityId": city["id"],
+        "position": city["pos"],
+        "action": "CityScreen",
+        "function": "updateOffers",
+        "backgroundView": "city",
+        "currentCityId": city["id"],
+        "templateView": "branchOfficeOwnOffers",
+        "currentTab": "tab_branchOfficeOwnOffers",
+        "actionRequest": actionRequest,
+        "ajax": "1",
+    }
+    for i, (amt_key, price_key, type_key) in enumerate(RESOURCE_PARAMS):
+        if i in resource_configs:
+            cfg = resource_configs[i]
+            payload[type_key] = cfg["type"]
+            payload[amt_key] = str(cfg["amount"])
+            payload[price_key] = str(cfg["price"])
+        else:
+            payload[type_key] = existing_types[i] if i < len(existing_types) else TRADE_SELL
+            payload[amt_key] = str(existing_amounts[i])
+            payload[price_key] = str(existing_prices[i])
+    return payload
+
+
+def process_own_offers(session, city, orders):
+    """Process all own_offer orders for a city.
+    Detects fulfilled trades, updates CSV orders, posts new offers.
+    Returns (updated_orders, notifications).
+    """
+    notifications = []
+
+    # Get current marketplace state
+    html = getMarketInfo(session, city)
+    current_amounts = onSellInMarket(html)
+    current_prices = getOwnOfferPrices(html)
+    current_types = getOwnOfferTradeTypes(html)
+    storage_cap = storageCapacityOfMarket(html)
+    price_limits = getPriceLimits(html)
+
+    # Refresh city data
+    city = _refresh_city(session, city)
+
+    # Group own_offer orders by resource
+    # Only one marketplace slot per resource, so if multiple orders exist for same resource,
+    # we process the highest priority one first
+    orders_by_resource = {}
+    for o in orders:
+        if o["mode"] != "own_offer" or o["status"] not in ("pending", "active"):
+            continue
+        idx = _resource_index(o["resource"])
+        if idx < 0:
+            continue
+        if idx not in orders_by_resource:
+            orders_by_resource[idx] = []
+        orders_by_resource[idx].append(o)
+
+    # Sort each resource's orders by priority then order_id
+    for idx in orders_by_resource:
+        orders_by_resource[idx].sort(key=lambda o: (o["priority"], o["order_id"]))
+
+    # Track what we expect on marketplace vs what's there now
+    # to detect fulfilled trades
+    resource_configs = {}
+    gold, _ = getGold(session, city)
+
+    for idx, res_orders in orders_by_resource.items():
+        if not res_orders:
+            continue
+
+        # The active order for this slot (highest priority)
+        active_order = res_orders[0]
+        active_order["status"] = "active"
+
+        # Detect fulfillment: if current amount is less than what we posted last time
+        # We track this via the notes field storing last posted amount
+        last_posted = _get_last_posted(active_order)
+        current = current_amounts[idx]
+        if last_posted > 0 and current < last_posted:
+            fulfilled = last_posted - current
+            active_order["quantity_fulfilled"] += fulfilled
+            active_order["quantity_remaining"] = max(0, active_order["quantity_remaining"] - fulfilled)
+            active_order["last_activity"] = getDateTime()
+
+            if active_order["order_type"] == "sell":
+                gold_earned = fulfilled * active_order["price"]
+                notifications.append("Sold {} {} @ {} = {} gold".format(
+                    addThousandSeparator(fulfilled), active_order["resource"],
+                    active_order["price"], addThousandSeparator(gold_earned)))
+            else:
+                gold_spent = fulfilled * active_order["price"]
+                notifications.append("Bought {} {} @ {} = {} gold".format(
+                    addThousandSeparator(fulfilled), active_order["resource"],
+                    active_order["price"], addThousandSeparator(gold_spent)))
+
+            # Check if complete
+            if active_order["quantity_remaining"] <= 0:
+                active_order["status"] = "complete"
+                notifications.append("ORDER #{} COMPLETE: {} {}".format(
+                    active_order["order_id"], active_order["order_type"].upper(),
+                    active_order["resource"]))
+                continue
+
+        # Skip if order is now complete
+        if active_order["quantity_remaining"] <= 0:
+            active_order["status"] = "complete"
+            continue
+
+        # Handle undercutting
+        price = active_order["price"]
+        if active_order.get("undercutting") == "yes" and idx < len(price_limits):
+            lo, hi = price_limits[idx]
+            if active_order["order_type"] == "sell":
+                lowest = scanMarketPrices(session, city, idx, "444")
+                if lowest is not None and lowest > lo:
+                    price = max(lo, lowest - 1)
+            else:
+                highest = scanMarketPrices(session, city, idx, "333")
+                if highest is not None and highest < hi:
+                    price = min(hi, highest + 1)
+            active_order["price"] = price
+
+        # Calculate amount to post
+        desired = active_order["quantity_remaining"]
+        if active_order["per_cycle"] > 0:
+            desired = min(desired, active_order["per_cycle"])
+
+        if active_order["order_type"] == "sell":
+            # Limit by city available resources
+            city_avail = city["availableResources"][idx] if idx < len(city.get("availableResources", [])) else 0
+            desired = min(desired, city_avail)
+            # Limit by storage capacity (account for other resources in storage)
+            other_storage = sum(current_amounts[j] for j in range(5) if j != idx and j not in resource_configs)
+            managed_storage = sum(resource_configs[j]["amount"] for j in resource_configs if resource_configs[j]["type"] == TRADE_SELL)
+            available_storage = max(0, storage_cap - other_storage - managed_storage)
+            desired = min(desired, available_storage)
+            trade_type = TRADE_SELL
+        else:
+            # Buy order: limit by gold and max buy
+            desired = min(desired, MAX_BUY_AMOUNT)
+            if price > 0:
+                affordable = gold // price
+                desired = min(desired, affordable)
+                gold -= desired * price
+            # Limit by warehouse space
+            free_space = city["freeSpaceForResources"][idx] if idx < len(city.get("freeSpaceForResources", [])) else 0
+            desired = min(desired, free_space)
+            trade_type = TRADE_BUY
+
+        amount = max(0, desired)
+        resource_configs[idx] = {"type": trade_type, "amount": amount, "price": price}
+        _set_last_posted(active_order, amount)
+
+    # Build and send payload if we have any managed resources
+    if resource_configs:
+        payload = _build_own_offer_payload(city, resource_configs, current_amounts, current_prices, current_types)
+        session.post(params=payload)
+
+    return orders, notifications
+
+
+def _get_last_posted(order):
+    """Extract last posted amount from order notes."""
+    notes = str(order.get("notes", ""))
+    match = re.search(r"last_posted:(\d+)", notes)
+    if match:
+        return int(match.group(1))
+    return 0
+
+
+def _set_last_posted(order, amount):
+    """Store last posted amount in order notes."""
+    notes = str(order.get("notes", ""))
+    notes = re.sub(r"last_posted:\d+", "", notes).strip()
+    if notes and not notes.endswith(";"):
+        notes += ";"
+    notes += "last_posted:{}".format(amount)
+    order["notes"] = notes
+
+
+def _update_status(session, orders):
+    """Update process status line with order summary."""
+    active = [o for o in orders if o["status"] in ("pending", "active")]
+    if not active:
+        session.setStatus("AutoTrader: idle | {}".format(getDateTime()))
+        return
+    parts = []
+    for o in active:
+        action = "B" if o["order_type"] == "buy" else "S"
+        res = o["resource"][:3]
+        remaining = addThousandSeparator(o["quantity_remaining"])
+        parts.append("#{}{}{} {}".format(o["order_id"], action, res, remaining))
+    status = "AutoTrader: {} | {}".format(" ".join(parts[:5]), getDateTime())
+    session.setStatus(status)
+
+
 def run_auto_trader(session, csv_path, interval_minutes, settings):
-    """Background loop that manages marketplace orders."""
+    """Background loop that manages marketplace orders.
+    Re-reads CSV each cycle for hot-reload support.
+    """
+    # Build city lookup from commercial cities
+    commercial_cities = getCommercialCities(session)
+    city_lookup = {str(c["id"]): c for c in commercial_cities}
+
     # Startup notification
     orders = read_orders(csv_path)
     active_count = len([o for o in orders if o["status"] in ("pending", "active")])
@@ -612,10 +826,79 @@ def run_auto_trader(session, csv_path, interval_minutes, settings):
         active_count, interval_minutes)
     sendToBot(session, msg)
 
+    _update_status(session, orders)
+
     while True:
         wait(interval_minutes * 60, maxrandom=60)
-        # Chunk 3 will implement the full cycle logic here
+
+        # Hot-reload CSV
         orders = read_orders(csv_path)
         if not any(o["status"] in ("pending", "active") for o in orders):
             sendToBot(session, "Auto Trader: all orders complete or paused.")
             return
+
+        # Activate pending orders
+        for o in orders:
+            if o["status"] == "pending":
+                o["status"] = "active"
+
+        # Sort by priority then order_id
+        orders.sort(key=lambda o: (o.get("priority", 2), o.get("order_id", 0)))
+
+        # Check action points
+        any_html = session.get(city_url + str(commercial_cities[0]["id"]))
+        action_points = getActionPoints(any_html)
+
+        # Group orders by city
+        city_groups = {}
+        for o in orders:
+            cid = str(o.get("city_id", ""))
+            if cid not in city_groups:
+                city_groups[cid] = []
+            city_groups[cid].append(o)
+
+        all_notifications = []
+
+        # Process each city's orders
+        for cid, city_orders in city_groups.items():
+            city = city_lookup.get(cid)
+            if not city:
+                continue
+
+            city = _refresh_city(session, city)
+            city_lookup[cid] = city
+
+            # Process own_offer orders
+            own_offer_orders = [o for o in city_orders if o["mode"] == "own_offer" and o["status"] == "active"]
+            if own_offer_orders:
+                _, notifs = process_own_offers(session, city, own_offer_orders)
+                all_notifications.extend(notifs)
+
+            # Process active trading orders (Chunk 4)
+            active_orders = [o for o in city_orders if o["mode"] == "active" and o["status"] == "active"]
+            if active_orders and action_points != 0:
+                notifs = process_active_orders(session, city, active_orders)
+                all_notifications.extend(notifs)
+            elif active_orders and action_points == 0:
+                all_notifications.append("Skipped active orders - 0 action points")
+
+        # Send notifications
+        if all_notifications:
+            msg = "Auto Trader:\n" + "\n".join("  " + n for n in all_notifications)
+            sendToBot(session, msg)
+
+        # Write updated CSV
+        write_orders(csv_path, orders)
+
+        # Update status
+        _update_status(session, orders)
+
+
+# ============================================================
+#  Active Trading (Chunk 4 - stub)
+# ============================================================
+
+def process_active_orders(session, city, orders):
+    """Process active buy/sell orders. Returns list of notification strings."""
+    # Chunk 4 will implement full active trading with ship batching
+    return []
