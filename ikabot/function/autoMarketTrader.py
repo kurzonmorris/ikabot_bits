@@ -1,5 +1,6 @@
 #! /usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Auto Market Trader v2.0.0
 
 import csv
 import json
@@ -29,6 +30,8 @@ from ikabot.function.buyResources import getOffers, buy
 # ============================================================
 #  Constants
 # ============================================================
+
+MODULE_VERSION = "v2.0.0"
 
 TRADE_BUY = "333"
 TRADE_SELL = "444"
@@ -461,6 +464,17 @@ def _refresh_city(session, city):
 #  Setup Flow
 # ============================================================
 
+def print_module_banner(page_title=None):
+    print("\n")
+    print("╔═══════════════════════════════════════════════════════════╗")
+    print("║                AUTO MARKET TRADER  {}                 ║".format(MODULE_VERSION))
+    print("╚═══════════════════════════════════════════════════════════╝")
+    if page_title:
+        print("\n{}".format(page_title))
+        print("──────────────────────────────────────────────────────────")
+    print("")
+
+
 def _choose_city(commercial_cities):
     """City picker for auto trader."""
     print("Which city's Trading Post should manage orders?\n")
@@ -636,7 +650,7 @@ def autoMarketTrader(session, event, stdin_fd, predetermined_input):
     sys.stdin = os.fdopen(stdin_fd)
     config.predetermined_input = predetermined_input
     try:
-        banner()
+        print_module_banner()
 
         # Find cities with trading posts
         commercial_cities = getCommercialCities(session)
@@ -651,7 +665,7 @@ def autoMarketTrader(session, event, stdin_fd, predetermined_input):
             city = commercial_cities[0]
         else:
             city = _choose_city(commercial_cities)
-        banner()
+        print_module_banner("City: {}".format(city["name"]))
 
         # Refresh city data
         city = _refresh_city(session, city)
@@ -682,7 +696,7 @@ def autoMarketTrader(session, event, stdin_fd, predetermined_input):
                 print("Orders cleared.\n")
             elif choice == 3:
                 # Skip straight to settings + launch
-                banner()
+                print_module_banner("Launch Settings")
                 print("Launching with existing {} orders.\n".format(len(existing_orders)))
                 display_orders(existing_orders)
 
@@ -707,7 +721,7 @@ def autoMarketTrader(session, event, stdin_fd, predetermined_input):
                 _launch_background(session, event, csv_path, city, existing_orders,
                                    interval, daily_summary, price_tracking)
                 return
-            banner()
+            print_module_banner("City Overview")
 
         # Show city info
         _show_city_info(session, city)
@@ -734,11 +748,10 @@ def autoMarketTrader(session, event, stdin_fd, predetermined_input):
             more = read(values=["y", "Y", "n", "N", ""])
             if more.lower() != "y":
                 break
-            banner()
+            print_module_banner("Create Order")
 
         # Settings
-        banner()
-        print("=== Settings ===\n")
+        print_module_banner("Settings")
 
         print("Check interval in minutes [15-240, default 60]:")
         interval_input = read(min=15, max=240, empty=True)
@@ -753,8 +766,7 @@ def autoMarketTrader(session, event, stdin_fd, predetermined_input):
         price_tracking = pt.lower() == "y"
 
         # Final summary
-        banner()
-        print("=== Auto Market Trader Summary ===\n")
+        print_module_banner("Summary")
         print("City: {} | Interval: {} min".format(city["name"], interval))
         print("Daily summary: {} | Price tracking: {}".format(
             "ON" if daily_summary else "OFF",
