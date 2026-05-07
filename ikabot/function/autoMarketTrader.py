@@ -60,8 +60,11 @@ CSV_COLUMNS = [
     "recurring",
     "daily_budget",
     "daily_spent",
+    "daily_reset_date",
     "status",
     "last_activity",
+    "last_posted",
+    "error_count",
     "notes",
 ]
 
@@ -73,6 +76,8 @@ PRICE_LOG_COLUMNS = [
     "num_offers",
     "city_id",
 ]
+
+MAX_ERROR_COUNT = 5
 
 VALID_RESOURCES = ["Wood", "Wine", "Marble", "Crystal", "Sulfur"]
 VALID_ORDER_TYPES = ["buy", "sell"]
@@ -107,20 +112,32 @@ def read_orders(csv_path):
     if not os.path.exists(csv_path):
         return []
     orders = []
+    int_fields = [
+        "order_id", "priority", "price", "quantity_remaining",
+        "quantity_fulfilled", "per_cycle", "daily_budget", "daily_spent",
+        "last_posted", "error_count",
+    ]
     try:
         with open(csv_path, "r", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 if validate_order(row):
-                    for field in ["order_id", "priority", "price", "quantity_remaining",
-                                  "quantity_fulfilled", "per_cycle", "daily_budget", "daily_spent"]:
+                    for field in int_fields:
                         try:
-                            row[field] = int(row[field]) if row[field] else 0
+                            row[field] = int(row[field]) if row.get(field) else 0
                         except (ValueError, KeyError):
                             row[field] = 0
+                    if "daily_reset_date" not in row or not row["daily_reset_date"]:
+                        row["daily_reset_date"] = ""
                     orders.append(row)
-    except Exception:
-        pass
+    except Exception as e:
+        err_path = csv_path + ".read_error.log"
+        try:
+            with open(err_path, "a") as ef:
+                ef.write("{} read_orders error: {}\n".format(
+                    datetime.now().isoformat(), traceback.format_exc()))
+        except IOError:
+            pass
     return orders
 
 
@@ -174,6 +191,189 @@ def validate_order(order):
     return True
 
 
+def verify_csv(csv_path, commercial_cities=None):
+    """Deep verification of CSV contents. Catches mistakes a human editor could make.
+    Returns (valid_orders, warnings) where warnings is a list of human-readable strings.
+    If commercial_cities is provided, also validates city_id references.
+    """
+    warnings = []
+
+    if not os.path.exists(csv_path):
+        return [], ["CSV file not found: {}".format(csv_path)]
+
+    valid_city_ids = set()
+    city_name_map = {}
+    if commercial_cities:
+        for c in commercial_cities:
+            cid = str(c["id"])
+            valid_city_ids.add(cid)
+            city_name_map[cid] = c["name"]
+
+    valid_orders = []
+    seen_ids = set()
+    row_num = 0
+
+    try:
+        with open(csv_path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+
+            if reader.fieldnames is None:
+                return [], ["CSV file is empty or has no header row"]
+
+            missing_cols = [c for c in CSV_COLUMNS if c not in reader.fieldnames]
+            if missing_cols:
+                warnings.append("Missing columns: {}. Old CSV format?".format(", ".join(missing_cols)))
+
+            extra_cols = [c for c in reader.fieldnames if c not in CSV_COLUMNS]
+            if extra_cols:
+                warnings.append("Unexpected columns (will be ignored): {}".format(", ".join(extra_cols)))
+
+            for row in reader:
+                row_num += 1
+                row_warnings = []
+                oid_raw = row.get("order_id", "")
+                label = "Row {}".format(row_num)
+
+                # order_id
+                try:
+                    oid = int(oid_raw) if oid_raw else 0
+                    if oid <= 0:
+                        row_warnings.append("order_id must be a positive integer, got '{}'".format(oid_raw))
+                    elif oid in seen_ids:
+                        row_warnings.append("duplicate order_id {}".format(oid))
+                    else:
+                        seen_ids.add(oid)
+                        label = "Order #{}".format(oid)
+                except ValueError:
+                    row_warnings.append("order_id '{}' is not a number".format(oid_raw))
+
+                # resource
+                res = row.get("resource", "").strip()
+                if not res:
+                    row_warnings.append("resource is empty")
+                elif res not in VALID_RESOURCES:
+                    close = [r for r in VALID_RESOURCES if r.lower() == res.lower()]
+                    if close:
+                        row_warnings.append("resource '{}' has wrong case, should be '{}'".format(res, close[0]))
+                    else:
+                        row_warnings.append("resource '{}' is not valid. Must be one of: {}".format(
+                            res, ", ".join(VALID_RESOURCES)))
+
+                # order_type
+                ot = row.get("order_type", "").strip()
+                if ot not in VALID_ORDER_TYPES:
+                    row_warnings.append("order_type '{}' invalid. Must be 'buy' or 'sell'".format(ot))
+
+                # mode
+                mode = row.get("mode", "").strip()
+                if mode not in VALID_MODES:
+                    row_warnings.append("mode '{}' invalid. Must be 'own_offer' or 'active'".format(mode))
+
+                # strategy
+                strat = row.get("strategy", "").strip()
+                if strat and strat not in VALID_STRATEGIES:
+                    row_warnings.append("strategy '{}' invalid. Must be one of: cheapest, closest, specific".format(strat))
+                if mode == "active" and not strat:
+                    row_warnings.append("active mode requires a strategy (cheapest/closest/specific)")
+                if strat == "specific" and not row.get("target_player", "").strip():
+                    row_warnings.append("strategy is 'specific' but target_player is empty")
+                if mode == "own_offer" and strat:
+                    row_warnings.append("own_offer mode does not use strategy (should be blank)")
+
+                # status
+                status = row.get("status", "").strip()
+                if status not in VALID_STATUSES:
+                    row_warnings.append("status '{}' invalid. Must be one of: {}".format(
+                        status, ", ".join(VALID_STATUSES)))
+
+                # Numeric fields
+                int_checks = {
+                    "price": (1, 999999, True),
+                    "quantity_remaining": (0, 999999999, True),
+                    "quantity_fulfilled": (0, 999999999, False),
+                    "per_cycle": (0, 999999999, False),
+                    "priority": (1, 3, True),
+                    "daily_budget": (0, 999999999, False),
+                    "daily_spent": (0, 999999999, False),
+                    "error_count": (0, 999, False),
+                    "last_posted": (0, 999999999, False),
+                }
+                for field, (lo, hi, required) in int_checks.items():
+                    val_raw = row.get(field, "").strip()
+                    if not val_raw:
+                        if required:
+                            row_warnings.append("{} is empty (required)".format(field))
+                        continue
+                    try:
+                        val = int(val_raw)
+                        if val < lo or val > hi:
+                            row_warnings.append("{} value {} is out of range [{}, {}]".format(field, val, lo, hi))
+                    except ValueError:
+                        row_warnings.append("{} '{}' is not a valid number".format(field, val_raw))
+
+                # city_id
+                cid = row.get("city_id", "").strip()
+                if not cid:
+                    row_warnings.append("city_id is empty")
+                elif valid_city_ids and cid not in valid_city_ids:
+                    row_warnings.append("city_id '{}' does not match any Trading Post city. Valid: {}".format(
+                        cid, ", ".join("{} ({})".format(k, city_name_map.get(k, "?")) for k in sorted(valid_city_ids))))
+
+                # city_name mismatches
+                cname = row.get("city_name", "").strip()
+                if cid and cid in city_name_map and cname and cname != city_name_map[cid]:
+                    row_warnings.append("city_name '{}' doesn't match city_id {} (expected '{}')".format(
+                        cname, cid, city_name_map[cid]))
+
+                # undercutting
+                uc = row.get("undercutting", "").strip()
+                if uc and uc not in ("yes", "no"):
+                    row_warnings.append("undercutting '{}' invalid. Must be 'yes' or 'no'".format(uc))
+                if uc == "yes" and mode == "active":
+                    row_warnings.append("undercutting only applies to own_offer mode")
+
+                # recurring
+                rec = row.get("recurring", "").strip()
+                if rec and rec != "none":
+                    if not (rec.startswith("amount:") or rec.startswith("budget:")):
+                        row_warnings.append("recurring '{}' invalid. Must be 'none', 'amount:N', or 'budget:N'".format(rec))
+                    else:
+                        parts = rec.split(":", 1)
+                        try:
+                            rval = int(parts[1])
+                            if rval <= 0:
+                                row_warnings.append("recurring value must be positive, got {}".format(rval))
+                        except (ValueError, IndexError):
+                            row_warnings.append("recurring '{}' has invalid number after ':'".format(rec))
+
+                # Logic checks
+                try:
+                    qty_remaining = int(row.get("quantity_remaining", 0) or 0)
+                    qty_fulfilled = int(row.get("quantity_fulfilled", 0) or 0)
+                    if status == "active" and qty_remaining <= 0:
+                        row_warnings.append("status is 'active' but quantity_remaining is 0 (should be 'complete')")
+                    if status == "complete" and qty_remaining > 0:
+                        row_warnings.append("status is 'complete' but quantity_remaining is {} (should be 'active')".format(qty_remaining))
+                    daily_budget = int(row.get("daily_budget", 0) or 0)
+                    daily_spent = int(row.get("daily_spent", 0) or 0)
+                    if daily_budget > 0 and daily_spent > daily_budget:
+                        row_warnings.append("daily_spent ({}) exceeds daily_budget ({})".format(daily_spent, daily_budget))
+                except (ValueError, TypeError):
+                    pass
+
+                if row_warnings:
+                    for w in row_warnings:
+                        warnings.append("{}: {}".format(label, w))
+                else:
+                    if validate_order(row):
+                        valid_orders.append(row)
+
+    except Exception:
+        warnings.append("Failed to read CSV: {}".format(traceback.format_exc()[-200:]))
+
+    return valid_orders, warnings
+
+
 def make_order(order_id, resource, order_type, mode, price, quantity,
                city_id, city_name, priority=2, strategy="", target_player="",
                per_cycle=0, undercutting="no", recurring="none",
@@ -197,8 +397,11 @@ def make_order(order_id, resource, order_type, mode, price, quantity,
         "recurring": recurring,
         "daily_budget": daily_budget,
         "daily_spent": 0,
+        "daily_reset_date": "",
         "status": "pending",
         "last_activity": getDateTime(),
+        "last_posted": 0,
+        "error_count": 0,
         "notes": "",
     }
 
@@ -458,6 +661,14 @@ def autoMarketTrader(session, event, stdin_fd, predetermined_input):
         existing_orders = read_orders(csv_path)
 
         if existing_orders:
+            # Verify CSV integrity before showing
+            _, csv_warnings = verify_csv(csv_path, commercial_cities)
+            if csv_warnings:
+                print("CSV verification warnings:\n")
+                for w in csv_warnings:
+                    print("  ! {}".format(w))
+                print("")
+
             print("Existing orders found:\n")
             display_orders(existing_orders)
             print("What would you like to do?")
@@ -640,14 +851,13 @@ def _build_own_offer_payload(city, resource_configs, existing_amounts, existing_
     return payload
 
 
-def process_own_offers(session, city, orders):
+def process_own_offers(session, city, orders, gold):
     """Process all own_offer orders for a city.
     Detects fulfilled trades, updates CSV orders, posts new offers.
-    Returns (updated_orders, notifications).
+    Returns (updated_orders, notifications, remaining_gold).
     """
     notifications = []
 
-    # Get current marketplace state
     html = getMarketInfo(session, city)
     current_amounts = onSellInMarket(html)
     current_prices = getOwnOfferPrices(html)
@@ -655,12 +865,8 @@ def process_own_offers(session, city, orders):
     storage_cap = storageCapacityOfMarket(html)
     price_limits = getPriceLimits(html)
 
-    # Refresh city data
     city = _refresh_city(session, city)
 
-    # Group own_offer orders by resource
-    # Only one marketplace slot per resource, so if multiple orders exist for same resource,
-    # we process the highest priority one first
     orders_by_resource = {}
     for o in orders:
         if o["mode"] != "own_offer" or o["status"] not in ("pending", "active"):
@@ -672,14 +878,10 @@ def process_own_offers(session, city, orders):
             orders_by_resource[idx] = []
         orders_by_resource[idx].append(o)
 
-    # Sort each resource's orders by priority then order_id
     for idx in orders_by_resource:
         orders_by_resource[idx].sort(key=lambda o: (o["priority"], o["order_id"]))
 
-    # Track what we expect on marketplace vs what's there now
-    # to detect fulfilled trades
     resource_configs = {}
-    gold, _ = getGold(session, city)
 
     for idx, res_orders in orders_by_resource.items():
         if not res_orders:
@@ -701,21 +903,24 @@ def process_own_offers(session, city, orders):
 
             if active_order["order_type"] == "sell":
                 gold_earned = fulfilled * active_order["price"]
-                notifications.append("Sold {} {} @ {} = {} gold".format(
+                notifications.append("#{} Sold {} {} @ {} = {} gold | {} remaining".format(
+                    active_order["order_id"],
                     addThousandSeparator(fulfilled), active_order["resource"],
-                    active_order["price"], addThousandSeparator(gold_earned)))
+                    active_order["price"], addThousandSeparator(gold_earned),
+                    addThousandSeparator(active_order["quantity_remaining"])))
             else:
                 gold_spent = fulfilled * active_order["price"]
-                notifications.append("Bought {} {} @ {} = {} gold".format(
+                notifications.append("#{} Bought {} {} @ {} = {} gold | {} remaining".format(
+                    active_order["order_id"],
                     addThousandSeparator(fulfilled), active_order["resource"],
-                    active_order["price"], addThousandSeparator(gold_spent)))
+                    active_order["price"], addThousandSeparator(gold_spent),
+                    addThousandSeparator(active_order["quantity_remaining"])))
 
-            # Check if complete
             if active_order["quantity_remaining"] <= 0:
                 active_order["status"] = "complete"
-                notifications.append("ORDER #{} COMPLETE: {} {}".format(
+                notifications.append("ORDER #{} COMPLETE: {} {} total".format(
                     active_order["order_id"], active_order["order_type"].upper(),
-                    active_order["resource"]))
+                    addThousandSeparator(active_order["quantity_fulfilled"])))
                 continue
 
         # Skip if order is now complete
@@ -768,31 +973,21 @@ def process_own_offers(session, city, orders):
         resource_configs[idx] = {"type": trade_type, "amount": amount, "price": price}
         _set_last_posted(active_order, amount)
 
-    # Build and send payload if we have any managed resources
     if resource_configs:
         payload = _build_own_offer_payload(city, resource_configs, current_amounts, current_prices, current_types)
         session.post(params=payload)
 
-    return orders, notifications
+    return orders, notifications, gold
 
 
 def _get_last_posted(order):
-    """Extract last posted amount from order notes."""
-    notes = str(order.get("notes", ""))
-    match = re.search(r"last_posted:(\d+)", notes)
-    if match:
-        return int(match.group(1))
-    return 0
+    """Get last posted amount from dedicated column."""
+    return int(order.get("last_posted", 0) or 0)
 
 
 def _set_last_posted(order, amount):
-    """Store last posted amount in order notes."""
-    notes = str(order.get("notes", ""))
-    notes = re.sub(r"last_posted:\d+", "", notes).strip()
-    if notes and not notes.endswith(";"):
-        notes += ";"
-    notes += "last_posted:{}".format(amount)
-    order["notes"] = notes
+    """Store last posted amount in dedicated column."""
+    order["last_posted"] = amount
 
 
 def _update_status(session, orders):
@@ -831,6 +1026,7 @@ def handle_recurring(orders):
                 amount = int(recurring.split(":")[1])
                 o["quantity_remaining"] = amount
                 o["quantity_fulfilled"] = 0
+                o["error_count"] = 0
                 o["status"] = "active"
                 o["last_activity"] = getDateTime()
                 o["notes"] = str(o.get("notes", "")) + ";reordered:{}".format(getDateTime())
@@ -846,6 +1042,7 @@ def handle_recurring(orders):
                     if quantity > 0:
                         o["quantity_remaining"] = quantity
                         o["quantity_fulfilled"] = 0
+                        o["error_count"] = 0
                         o["daily_budget"] = budget
                         o["daily_spent"] = 0
                         o["status"] = "active"
@@ -856,12 +1053,16 @@ def handle_recurring(orders):
 
 
 def _reset_daily_if_new_day(orders):
-    """Reset daily_spent for all orders if a new day has started."""
+    """Reset daily_spent for all orders if a new day has started.
+    Uses daily_reset_date to track when the last reset occurred per order,
+    ensuring we reset exactly once per day regardless of activity.
+    """
     today = datetime.now().strftime("%Y-%m-%d")
     for o in orders:
-        last = str(o.get("last_activity", ""))
-        if last and not last.startswith(today):
+        last_reset = str(o.get("daily_reset_date", ""))
+        if last_reset != today:
             o["daily_spent"] = 0
+            o["daily_reset_date"] = today
 
 
 SUMMARY_FILE_SUFFIX = "_last_summary.txt"
@@ -884,12 +1085,16 @@ def _maybe_send_daily_summary(session, orders, csv_path):
         except (ValueError, IOError):
             pass
 
-    # Check if anything happened today
+    # Check if anything happened today: daily_spent > 0 means gold was used,
+    # or last_activity is from today with a status change (completed orders)
     today = datetime.now().strftime("%Y-%m-%d")
     activity_today = False
     for o in orders:
+        if int(o.get("daily_spent", 0)) > 0:
+            activity_today = True
+            break
         last = str(o.get("last_activity", ""))
-        if last.startswith(today) and o["quantity_fulfilled"] > 0:
+        if last.startswith(today) and o["status"] == "complete":
             activity_today = True
             break
 
@@ -938,15 +1143,31 @@ def _maybe_send_daily_summary(session, orders, csv_path):
         pass
 
 
+def _trim_notes(order, max_len=500):
+    """Trim notes field to prevent unbounded growth."""
+    notes = str(order.get("notes", ""))
+    if len(notes) > max_len:
+        order["notes"] = "..." + notes[-(max_len - 3):]
+
+
+def _increment_error(order, reason=""):
+    """Increment error count and escalate to error status if threshold reached."""
+    order["error_count"] = int(order.get("error_count", 0)) + 1
+    if reason:
+        order["notes"] = str(order.get("notes", "")) + ";error:{}:{}".format(
+            getDateTime(), reason[:80])
+    if order["error_count"] >= MAX_ERROR_COUNT:
+        order["status"] = "error"
+        order["notes"] = str(order.get("notes", "")) + ";escalated_to_error:{}".format(getDateTime())
+
+
 def run_auto_trader(session, csv_path, interval_minutes, settings):
     """Background loop that manages marketplace orders.
     Re-reads CSV each cycle for hot-reload support.
     """
-    # Build city lookup from commercial cities
     commercial_cities = getCommercialCities(session)
     city_lookup = {str(c["id"]): c for c in commercial_cities}
 
-    # Startup notification
     orders = read_orders(csv_path)
     active_count = len([o for o in orders if o["status"] in ("pending", "active")])
     msg = "Auto Trader started: {} active orders, interval {} min".format(
@@ -958,7 +1179,14 @@ def run_auto_trader(session, csv_path, interval_minutes, settings):
     while True:
         wait(interval_minutes * 60, maxrandom=60)
 
-        # Hot-reload CSV
+        # Hot-reload CSV with verification
+        orders, csv_warnings = verify_csv(csv_path, commercial_cities)
+        if csv_warnings:
+            warn_msg = "Auto Trader CSV warnings:\n" + "\n".join("  " + w for w in csv_warnings[:10])
+            if len(csv_warnings) > 10:
+                warn_msg += "\n  ...and {} more".format(len(csv_warnings) - 10)
+            sendToBot(session, warn_msg)
+        # Re-read with integer conversion for verified orders
         orders = read_orders(csv_path)
         if not any(o["status"] in ("pending", "active") for o in orders):
             sendToBot(session, "Auto Trader: all orders complete or paused.")
@@ -968,6 +1196,9 @@ def run_auto_trader(session, csv_path, interval_minutes, settings):
         for o in orders:
             if o["status"] == "pending":
                 o["status"] = "active"
+
+        # Reset daily_spent before processing (so budget is fresh for new day)
+        _reset_daily_if_new_day(orders)
 
         # Sort by priority then order_id
         orders.sort(key=lambda o: (o.get("priority", 2), o.get("order_id", 0)))
@@ -986,49 +1217,68 @@ def run_auto_trader(session, csv_path, interval_minutes, settings):
 
         all_notifications = []
 
-        # Process each city's orders
+        # Process each city's orders with per-city error handling
         for cid, city_orders in city_groups.items():
             city = city_lookup.get(cid)
             if not city:
+                for o in city_orders:
+                    _increment_error(o, "city_not_found")
                 continue
 
-            city = _refresh_city(session, city)
-            city_lookup[cid] = city
+            try:
+                city = _refresh_city(session, city)
+                city_lookup[cid] = city
 
-            # Process own_offer orders
-            own_offer_orders = [o for o in city_orders if o["mode"] == "own_offer" and o["status"] == "active"]
-            if own_offer_orders:
-                _, notifs = process_own_offers(session, city, own_offer_orders)
-                all_notifications.extend(notifs)
+                # Get gold once per city to share across both modes
+                gold, _ = getGold(session, city)
 
-            # Process active trading orders (Chunk 4)
-            active_orders = [o for o in city_orders if o["mode"] == "active" and o["status"] == "active"]
-            if active_orders and action_points != 0:
-                notifs = process_active_orders(session, city, active_orders)
-                all_notifications.extend(notifs)
-            elif active_orders and action_points == 0:
-                all_notifications.append("Skipped active orders - 0 action points")
+                # Process own_offer orders
+                own_offer_orders = [o for o in city_orders if o["mode"] == "own_offer" and o["status"] == "active"]
+                if own_offer_orders:
+                    _, notifs, gold = process_own_offers(session, city, own_offer_orders, gold)
+                    all_notifications.extend(notifs)
 
-            # Price tracking
-            if settings.get("price_tracking"):
-                price_log_path = get_price_log_path(session)
-                tracked_resources = set()
+                # Process active trading orders
+                active_orders = [o for o in city_orders if o["mode"] == "active" and o["status"] == "active"]
+                if active_orders and action_points != 0:
+                    notifs = process_active_orders(session, city, active_orders, gold)
+                    all_notifications.extend(notifs)
+                elif active_orders and action_points == 0:
+                    all_notifications.append("Skipped active orders - 0 action points")
+
+                # Price tracking
+                if settings.get("price_tracking"):
+                    price_log_path = get_price_log_path(session)
+                    tracked_resources = set()
+                    for o in city_orders:
+                        if o["status"] == "active":
+                            tracked_resources.add(o["resource"])
+                    for res_name in tracked_resources:
+                        res_idx = _resource_index(res_name)
+                        if res_idx < 0:
+                            continue
+                        lowest = scanMarketPrices(session, city, res_idx, "444")
+                        highest = scanMarketPrices(session, city, res_idx, "333")
+                        log_price(price_log_path, res_name, lowest, highest, 0, str(city["id"]))
+
+                # Reset error count for orders that processed successfully
                 for o in city_orders:
                     if o["status"] == "active":
-                        tracked_resources.add(o["resource"])
-                for res_name in tracked_resources:
-                    res_idx = _resource_index(res_name)
-                    if res_idx < 0:
-                        continue
-                    lowest = scanMarketPrices(session, city, res_idx, "444")
-                    highest = scanMarketPrices(session, city, res_idx, "333")
-                    log_price(price_log_path, res_name, lowest, highest, 0, str(city["id"]))
+                        o["error_count"] = 0
+
+            except Exception:
+                err_msg = "Error processing city {}: {}".format(cid, traceback.format_exc()[-200:])
+                all_notifications.append(err_msg)
+                for o in city_orders:
+                    if o["status"] == "active":
+                        _increment_error(o, "city_processing_error")
 
         # Handle recurring orders
         handle_recurring(orders)
 
-        # Reset daily_spent if new day
-        _reset_daily_if_new_day(orders)
+        # Trim notes to prevent unbounded growth
+        for o in orders:
+            _trim_notes(o)
 
         # Send notifications
         if all_notifications:
@@ -1039,8 +1289,12 @@ def run_auto_trader(session, csv_path, interval_minutes, settings):
         if settings.get("daily_summary"):
             _maybe_send_daily_summary(session, orders, csv_path)
 
-        # Write updated CSV
-        write_orders(csv_path, orders)
+        # Write updated CSV (protected so a write failure doesn't kill the bot)
+        try:
+            write_orders(csv_path, orders)
+        except Exception:
+            sendToBot(session, "Auto Trader: CSV write error: {}".format(
+                traceback.format_exc()[-200:]))
 
         # Update status
         _update_status(session, orders)
@@ -1125,13 +1379,34 @@ def allocate_ships(orders, total_ships, ship_capacity):
     return allocation
 
 
-def process_active_orders(session, city, orders):
+def _verify_offer(session, city, offer, res_idx):
+    """Re-fetch marketplace offers and verify that the target offer still exists
+    with the expected player, price, and availability.
+    Returns the refreshed offer dict if valid, or None if stale/gone.
+    """
+    try:
+        _set_resource_filter(session, city, res_idx)
+        fresh_offers = getOffers(session, city)
+    except Exception:
+        return None
+
+    for fresh in fresh_offers:
+        if (fresh.get("jugadorAComprar") == offer.get("jugadorAComprar")
+                and fresh.get("destinationCityId") == offer.get("destinationCityId")
+                and fresh.get("precio") <= offer.get("precio", 0)):
+            offer["amountAvailable"] = fresh["amountAvailable"]
+            offer["precio"] = fresh["precio"]
+            return offer
+    return None
+
+
+def process_active_orders(session, city, orders, gold):
     """Process active buy/sell orders with smart ship batching.
+    Uses shared gold pool from caller.
     Returns list of notification strings.
     """
     notifications = []
 
-    # Get available ships and capacity
     ships_available = getAvailableShips(session)
     if ships_available <= 0:
         return []
@@ -1140,26 +1415,18 @@ def process_active_orders(session, city, orders):
     if ship_capacity <= 0:
         return []
 
-    # Separate buy and sell orders
     buy_orders = [o for o in orders if o["order_type"] == "buy" and o["quantity_remaining"] > 0]
     sell_orders = [o for o in orders if o["order_type"] == "sell" and o["quantity_remaining"] > 0]
 
-    # Sort by priority
     buy_orders.sort(key=lambda o: (o["priority"], o["order_id"]))
 
-    # Allocate ships across buy orders
     ship_allocation = allocate_ships(buy_orders, ships_available, ship_capacity)
 
-    # Get gold once
-    gold, _ = getGold(session, city)
-
-    # Process buy orders
     for order in buy_orders:
         alloc_ships = ship_allocation.get(order["order_id"], 0)
         if alloc_ships <= 0:
             continue
 
-        # Check daily budget
         if order["daily_budget"] > 0 and order["daily_spent"] >= order["daily_budget"]:
             continue
 
@@ -1167,43 +1434,41 @@ def process_active_orders(session, city, orders):
         if res_idx < 0:
             continue
 
-        # Set marketplace filter and get offers
-        _set_resource_filter(session, city, res_idx)
-        offers = getOffers(session, city)
+        try:
+            _set_resource_filter(session, city, res_idx)
+            offers = getOffers(session, city)
+        except Exception:
+            _increment_error(order, "getOffers_failed")
+            continue
+
         if not offers:
             continue
 
-        # Apply strategy filter
         if order["strategy"] == "specific" and order.get("target_player"):
             offers = filter_offers_by_player(offers, order["target_player"])
         elif order["strategy"] == "closest":
             offers = sort_offers_by_distance(offers)
 
-        # Filter by max price
         offers = filter_offers_by_max_price(offers, order["price"])
 
         if not offers:
             continue
 
-        # Calculate how much we can buy this cycle
         capacity = alloc_ships * ship_capacity
         desired = min(order["quantity_remaining"], capacity)
         if order["per_cycle"] > 0:
             desired = min(desired, order["per_cycle"])
 
-        # Check gold
         if order["price"] > 0:
             affordable = gold // order["price"]
             desired = min(desired, affordable)
 
-        # Check daily budget remaining
         if order["daily_budget"] > 0:
             budget_remaining = order["daily_budget"] - order["daily_spent"]
             if order["price"] > 0:
                 budget_affordable = budget_remaining // order["price"]
                 desired = min(desired, budget_affordable)
 
-        # Check warehouse space
         city = _refresh_city(session, city)
         free_space = city["freeSpaceForResources"][res_idx] if res_idx < len(city.get("freeSpaceForResources", [])) else 0
         desired = min(desired, free_space)
@@ -1211,59 +1476,72 @@ def process_active_orders(session, city, orders):
         if desired <= 0:
             continue
 
-        # Buy from offers (process best offer first)
         amount_bought = 0
+        last_offer = None
         for offer in offers:
             if desired <= 0:
                 break
             if offer["amountAvailable"] <= 0:
                 continue
 
-            # Verify offer price is still acceptable
             if offer["precio"] > order["price"]:
                 continue
 
-            buy_amount = min(desired, offer["amountAvailable"])
+            # Stale offer protection: re-fetch and verify before purchasing
+            verified = _verify_offer(session, city, offer, res_idx)
+            if verified is None:
+                notifications.append("#{} offer from {} gone/changed, skipping".format(
+                    order["order_id"], offer.get("jugadorAComprar", "?")))
+                continue
+
+            if verified["amountAvailable"] <= 0:
+                continue
+            if verified["precio"] > order["price"]:
+                notifications.append("#{} price changed to {} (max {}), skipping".format(
+                    order["order_id"], verified["precio"], order["price"]))
+                continue
+
+            buy_amount = min(desired, verified["amountAvailable"])
 
             try:
-                buy(session, city, offer, buy_amount, alloc_ships, ship_capacity)
+                buy(session, city, verified, buy_amount, alloc_ships, ship_capacity)
                 amount_bought += buy_amount
                 desired -= buy_amount
-                cost = buy_amount * offer["precio"]
+                cost = buy_amount * verified["precio"]
                 gold -= cost
                 order["daily_spent"] += cost
-                break  # One purchase per cycle per order to avoid overwhelming ships
+                last_offer = verified
+                break
             except Exception:
-                order["notes"] = str(order.get("notes", "")) + ";buy_error:{}".format(getDateTime())
+                _increment_error(order, "buy_failed")
                 break
 
-        if amount_bought > 0:
+        if amount_bought > 0 and last_offer is not None:
             order["quantity_remaining"] -= amount_bought
             order["quantity_fulfilled"] += amount_bought
             order["last_activity"] = getDateTime()
-            notifications.append("Bought {} {} @ {} from {}".format(
+            notifications.append("#{} Shipped {} {} @ {} from {} | {} remaining".format(
+                order["order_id"],
                 addThousandSeparator(amount_bought), order["resource"],
-                offer["precio"], offer.get("jugadorAComprar", "?")))
+                last_offer["precio"], last_offer.get("jugadorAComprar", "?"),
+                addThousandSeparator(order["quantity_remaining"])))
 
             if order["quantity_remaining"] <= 0:
                 order["status"] = "complete"
-                notifications.append("ORDER #{} COMPLETE: BUY {}".format(
-                    order["order_id"], order["resource"]))
+                notifications.append("ORDER #{} COMPLETE: {} {} total".format(
+                    order["order_id"], order["order_type"].upper(),
+                    addThousandSeparator(order["quantity_fulfilled"])))
 
-    # Process sell orders (browse buy offers from other players)
     for order in sell_orders:
         res_idx = _resource_index(order["resource"])
         if res_idx < 0:
             continue
 
-        # Check city has resources to sell
         city = _refresh_city(session, city)
         city_avail = city["availableResources"][res_idx] if res_idx < len(city.get("availableResources", [])) else 0
         if city_avail <= 0:
             continue
 
-        # For active selling, we browse buy offers (type 333) and sell to the highest bidder
-        # This uses the same marketplace scan mechanism
         search_resource = "resource" if res_idx == 0 else str(res_idx)
         data = {
             "cityId": city["id"],
@@ -1280,25 +1558,20 @@ def process_active_orders(session, city, orders):
             "actionRequest": actionRequest,
             "ajax": "1",
         }
-        resp = session.post(params=data)
         try:
+            resp = session.post(params=data)
             html = json.loads(resp, strict=False)[1][1][1]
-        except (json.JSONDecodeError, IndexError, KeyError):
+        except (json.JSONDecodeError, IndexError, KeyError, Exception):
             continue
 
-        # Parse buy offers (people wanting to buy = we can sell to them)
-        # Buy offers show: player wanting to buy, amount they want, price they'll pay
         buy_offer_prices = re.findall(r'white-space:nowrap;">(\d+)\s', html)
         if not buy_offer_prices:
             continue
 
-        # Check if best buy offer meets our minimum price
         best_price = max(int(p) for p in buy_offer_prices)
         if best_price < order["price"]:
             continue
 
-        # Active selling to buy offers would require different API calls
-        # than what's currently available. For now, log that opportunity exists.
         order["notes"] = str(order.get("notes", "")) + ";sell_opportunity:{}@{}".format(
             order["resource"], best_price)
 
