@@ -161,6 +161,43 @@ def scanMarketPrices(session, city, resource_index, scan_type="444"):
         return max(prices)  # highest buy price to outbid
 
 
+def getActionPoints(html):
+    """Parse current action points from page HTML.
+    Parameters
+    ----------
+    html : str
+        Any page HTML containing the global menu or headerData JSON
+    Returns
+    -------
+    action_points : int
+        Current available action points, or -1 if not found
+    """
+    match = re.search(r'id="js_GlobalMenu_maxActionPoints"[^>]*>(\d+)<', html)
+    if match:
+        return int(match.group(1))
+    match = re.search(r'"maxActionPoints"\s*:\s*(\d+)', html)
+    if match:
+        return int(match.group(1))
+    return -1
+
+
+def sort_offers_by_distance(offers):
+    """Sort offers by distance (closest first).
+    Uses bienesXminuto as a proxy — lower value means closer.
+    """
+    return sorted(offers, key=lambda o: o.get("bienesXminuto", 999999))
+
+
+def filter_offers_by_player(offers, player_name):
+    """Filter offers to only those from a specific player."""
+    return [o for o in offers if o.get("jugadorAComprar", "").lower() == player_name.lower()]
+
+
+def filter_offers_by_max_price(offers, max_price):
+    """Filter out offers priced above max_price."""
+    return [o for o in offers if o.get("precio", 0) <= max_price]
+
+
 def getGold(session, city):
     """
     Parameters
