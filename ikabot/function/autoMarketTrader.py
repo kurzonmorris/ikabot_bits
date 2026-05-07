@@ -811,6 +811,133 @@ def _update_status(session, orders):
     session.setStatus(status)
 
 
+# ============================================================
+#  Recurring Orders, Daily Summary, Price Tracking
+# ============================================================
+
+def handle_recurring(orders):
+    """Handle completed orders that have recurring set.
+    Resets quantity_remaining and status for recurring orders.
+    """
+    for o in orders:
+        if o["status"] != "complete":
+            continue
+        recurring = str(o.get("recurring", "none"))
+        if recurring == "none" or not recurring:
+            continue
+
+        if recurring.startswith("amount:"):
+            try:
+                amount = int(recurring.split(":")[1])
+                o["quantity_remaining"] = amount
+                o["quantity_fulfilled"] = 0
+                o["status"] = "active"
+                o["last_activity"] = getDateTime()
+                o["notes"] = str(o.get("notes", "")) + ";reordered:{}".format(getDateTime())
+            except (ValueError, IndexError):
+                pass
+
+        elif recurring.startswith("budget:"):
+            try:
+                budget = int(recurring.split(":")[1])
+                price = int(o.get("price", 1))
+                if price > 0:
+                    quantity = budget // price
+                    if quantity > 0:
+                        o["quantity_remaining"] = quantity
+                        o["quantity_fulfilled"] = 0
+                        o["daily_budget"] = budget
+                        o["daily_spent"] = 0
+                        o["status"] = "active"
+                        o["last_activity"] = getDateTime()
+                        o["notes"] = str(o.get("notes", "")) + ";reordered_budget:{}".format(getDateTime())
+            except (ValueError, IndexError):
+                pass
+
+
+def _reset_daily_if_new_day(orders):
+    """Reset daily_spent for all orders if a new day has started."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    for o in orders:
+        last = str(o.get("last_activity", ""))
+        if last and not last.startswith(today):
+            o["daily_spent"] = 0
+
+
+SUMMARY_FILE_SUFFIX = "_last_summary.txt"
+
+
+def _maybe_send_daily_summary(session, orders, csv_path):
+    """Send daily summary if 24 hours have passed since last one.
+    Suppresses if nothing happened.
+    """
+    summary_file = csv_path + SUMMARY_FILE_SUFFIX
+    now = time.time()
+
+    # Check if 24h since last summary
+    if os.path.exists(summary_file):
+        try:
+            with open(summary_file, "r") as f:
+                last_ts = float(f.read().strip())
+            if now - last_ts < 86400:
+                return
+        except (ValueError, IOError):
+            pass
+
+    # Check if anything happened today
+    today = datetime.now().strftime("%Y-%m-%d")
+    activity_today = False
+    for o in orders:
+        last = str(o.get("last_activity", ""))
+        if last.startswith(today) and o["quantity_fulfilled"] > 0:
+            activity_today = True
+            break
+
+    if not activity_today:
+        return
+
+    # Build summary
+    completed = [o for o in orders if o["status"] == "complete"]
+    active = [o for o in orders if o["status"] == "active"]
+    total_fulfilled = {}
+    total_spent = 0
+    for o in orders:
+        res = o["resource"]
+        if res not in total_fulfilled:
+            total_fulfilled[res] = 0
+        total_fulfilled[res] += int(o.get("quantity_fulfilled", 0))
+        total_spent += int(o.get("daily_spent", 0))
+
+    msg = "Auto Trader Daily Summary:\n"
+    msg += "  Active: {} | Completed: {}\n".format(len(active), len(completed))
+    if total_fulfilled:
+        msg += "  Traded: "
+        parts = []
+        for res, qty in total_fulfilled.items():
+            if qty > 0:
+                parts.append("{} {}".format(addThousandSeparator(qty), res))
+        msg += ", ".join(parts) if parts else "nothing"
+        msg += "\n"
+    if total_spent > 0:
+        msg += "  Gold spent today: {}\n".format(addThousandSeparator(total_spent))
+    for o in active:
+        pct = 0
+        total = o["quantity_fulfilled"] + o["quantity_remaining"]
+        if total > 0:
+            pct = int(o["quantity_fulfilled"] * 100 / total)
+        msg += "  #{} {} {} {}% done\n".format(
+            o["order_id"], o["order_type"].upper(), o["resource"], pct)
+
+    sendToBot(session, msg)
+
+    # Record summary timestamp
+    try:
+        with open(summary_file, "w") as f:
+            f.write(str(now))
+    except IOError:
+        pass
+
+
 def run_auto_trader(session, csv_path, interval_minutes, settings):
     """Background loop that manages marketplace orders.
     Re-reads CSV each cycle for hot-reload support.
@@ -882,10 +1009,35 @@ def run_auto_trader(session, csv_path, interval_minutes, settings):
             elif active_orders and action_points == 0:
                 all_notifications.append("Skipped active orders - 0 action points")
 
+            # Price tracking
+            if settings.get("price_tracking"):
+                price_log_path = get_price_log_path(session)
+                tracked_resources = set()
+                for o in city_orders:
+                    if o["status"] == "active":
+                        tracked_resources.add(o["resource"])
+                for res_name in tracked_resources:
+                    res_idx = _resource_index(res_name)
+                    if res_idx < 0:
+                        continue
+                    lowest = scanMarketPrices(session, city, res_idx, "444")
+                    highest = scanMarketPrices(session, city, res_idx, "333")
+                    log_price(price_log_path, res_name, lowest, highest, 0, str(city["id"]))
+
+        # Handle recurring orders
+        handle_recurring(orders)
+
+        # Reset daily_spent if new day
+        _reset_daily_if_new_day(orders)
+
         # Send notifications
         if all_notifications:
             msg = "Auto Trader:\n" + "\n".join("  " + n for n in all_notifications)
             sendToBot(session, msg)
+
+        # Daily summary
+        if settings.get("daily_summary"):
+            _maybe_send_daily_summary(session, orders, csv_path)
 
         # Write updated CSV
         write_orders(csv_path, orders)
